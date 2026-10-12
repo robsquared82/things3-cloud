@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 use tracing::{debug, error};
 
@@ -36,21 +36,33 @@ impl CloudWriter for LoggingCloudWriter {
         ancestor_index: Option<i64>,
     ) -> Result<i64> {
         let uuids = changes.keys().cloned().collect::<Vec<_>>();
-        let request_value = json!({
-            "ancestor_index": ancestor_index.unwrap_or(self.inner.head_index()),
-            "changes": &changes,
-        });
-        let request_json =
-            serde_json::to_string(&request_value).unwrap_or_else(|_| "{}".to_string());
-        debug!(
-            target: "things_cli::cloud_commit::request",
-            event = "cloud.commit.request",
-            ancestor_index,
-            change_count = uuids.len(),
-            uuids = ?uuids,
-            request_json = %request_json,
-            "cloud commit request"
-        );
+        // Task titles and notes stay out of logs unless a test harness opts in.
+        if std::env::var("THINGS3_LOG_COMMIT_BODY").ok().as_deref() == Some("1") {
+            let request_value = json!({
+                "ancestor_index": ancestor_index.unwrap_or(self.inner.head_index()),
+                "changes": &changes,
+            });
+            let request_json =
+                serde_json::to_string(&request_value).unwrap_or_else(|_| "{}".to_string());
+            debug!(
+                target: "things_cli::cloud_commit::request",
+                event = "cloud.commit.request",
+                ancestor_index,
+                change_count = uuids.len(),
+                uuids = ?uuids,
+                request_json = %request_json,
+                "cloud commit request"
+            );
+        } else {
+            debug!(
+                target: "things_cli::cloud_commit::request",
+                event = "cloud.commit.request",
+                ancestor_index,
+                change_count = uuids.len(),
+                uuids = ?uuids,
+                "cloud commit request"
+            );
+        }
 
         match self.inner.commit(changes, ancestor_index) {
             Ok(head_index) => {
@@ -104,8 +116,10 @@ impl LiveCloudWriter {
     pub fn new() -> Result<Self> {
         let (email, password) = load_auth()?;
         let mut client = ThingsCloudClient::new(email, password)?;
-        let _ = client.authenticate();
-        client.head_index = read_cached_head_index(&append_log_dir());
+        client
+            .authenticate()
+            .context("Things Cloud authentication failed")?;
+        client.head_index = read_cached_head_index(&append_log_dir())?;
         Ok(Self { client })
     }
 }

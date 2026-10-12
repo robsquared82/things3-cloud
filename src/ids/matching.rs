@@ -82,25 +82,24 @@ fn lcp_len_bytes(a: &[u8], b: &[u8]) -> usize {
     max
 }
 
-pub fn prefix_matches<'a>(sorted_ids: &'a [ThingsId], prefix: &str) -> Vec<&'a ThingsId> {
+/// Every id whose base58 form starts with `prefix`.
+///
+/// Callers pass ids sorted by raw-byte order. That order is not base58 order,
+/// so matches for one prefix are not contiguous. Scanning must not stop at the
+/// first miss, or an ambiguous prefix is treated as a single task and a write
+/// lands on the wrong item.
+pub fn prefix_matches<'a>(ids: &'a [ThingsId], prefix: &str) -> Vec<&'a ThingsId> {
     let prefix = prefix.as_bytes();
     if prefix.is_empty() {
-        return sorted_ids.iter().collect();
+        return ids.iter().collect();
     }
 
-    let mut matches = Vec::new();
-    let mut collecting = false;
-    for id in sorted_ids {
-        let (buf, len) = base58_encode_fixed(id.as_bytes());
-        let encoded = &buf[..len];
-        if encoded.starts_with(prefix) {
-            matches.push(id);
-            collecting = true;
-        } else if collecting {
-            break;
-        }
-    }
-    matches
+    ids.iter()
+        .filter(|id| {
+            let (buf, len) = base58_encode_fixed(id.as_bytes());
+            buf[..len].starts_with(prefix)
+        })
+        .collect()
 }
 
 #[cfg(test)]

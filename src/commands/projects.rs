@@ -148,8 +148,16 @@ fn build_projects_edit_plan(
             update.area_ids = Some(vec![]);
             labels.push("move=clear".to_string());
         } else {
-            let (resolved_project, _, _) = store.resolve_mark_identifier(move_raw);
-            let (area, _, _) = store.resolve_area_identifier(move_raw);
+            let (resolved_project, _, project_ambiguous) = store.resolve_mark_identifier(move_raw);
+            let (area, _, area_ambiguous) = store.resolve_area_identifier(move_raw);
+            if !project_ambiguous.is_empty()
+                || !area_ambiguous.is_empty()
+                || (resolved_project.is_some() && area.is_some())
+            {
+                return Err(format!(
+                    "Ambiguous --move target '{move_raw}'. Refusing to move."
+                ));
+            }
             let project_uuid = resolved_project.as_ref().and_then(|p| {
                 if p.is_project() {
                     Some(p.uuid.clone())

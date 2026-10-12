@@ -383,6 +383,38 @@ mod tests {
     }
 
     #[test]
+    fn prefix_matches_keeps_hits_that_byte_order_splits() {
+        use crate::ids::matching::prefix_matches;
+
+        // Raw-byte order is not base58 order. These three are sorted by bytes.
+        // The first and third encode with prefix "8"; the middle one does not.
+        // Stopping at the first miss would edit only one of the two "8" tasks.
+        let ids = [
+            ThingsId([
+                0x01, 0x06, 0x89, 0x85, 0x30, 0x2f, 0xf7, 0xdb, 0x23, 0xf7, 0x54, 0x7d, 0x17, 0xbf,
+                0x9f, 0x5f,
+            ]),
+            ThingsId([
+                0x01, 0x1e, 0x80, 0x80, 0x06, 0xfa, 0x1f, 0x11, 0xfa, 0xc9, 0x44, 0x0f, 0x3a, 0x1d,
+                0x31, 0xed,
+            ]),
+            ThingsId([
+                0x40, 0xc5, 0x80, 0x1c, 0x5c, 0x85, 0xd2, 0x0f, 0x8a, 0xef, 0x09, 0x25, 0x1a, 0x6e,
+                0x79, 0x45,
+            ]),
+        ];
+        assert!(ids[0] < ids[1] && ids[1] < ids[2]);
+        assert!(ids[0].to_string().starts_with('8'));
+        assert!(!ids[1].to_string().starts_with('8'));
+        assert!(ids[2].to_string().starts_with('8'));
+
+        let matches = prefix_matches(&ids, "8");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], &ids[0]);
+        assert_eq!(matches[1], &ids[2]);
+    }
+
+    #[test]
     fn base58_encode_fixed_preserves_sort_order() {
         let ids: Vec<ThingsId> = (0..50).map(|_| ThingsId::random()).collect();
         let mut by_fixed: Vec<String> = ids

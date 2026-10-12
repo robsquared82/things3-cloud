@@ -8,7 +8,10 @@ use crate::{
     arg_types::IdentifierToken,
     commands::Command,
     common::{DIM, GREEN, ICONS, colored},
-    wire::wire_object::{EntityType, WireObject},
+    wire::{
+        task::TaskPatch,
+        wire_object::{EntityType, WireObject},
+    },
 };
 
 #[derive(Debug, Args)]
@@ -24,56 +27,48 @@ struct DeletePlan {
     changes: BTreeMap<String, WireObject>,
 }
 
-fn build_delete_plan(args: &DeleteArgs, store: &crate::store::ThingsStore) -> DeletePlan {
+fn build_delete_plan(
+    args: &DeleteArgs,
+    store: &crate::store::ThingsStore,
+    now: f64,
+) -> Result<DeletePlan, String> {
     let mut targets: Vec<(String, EntityType, String)> = Vec::new();
     let mut seen = HashSet::new();
 
     for identifier in &args.item_ids {
         let (task, task_err, task_ambiguous) = store.resolve_task_identifier(identifier.as_str());
-        let (area, area_err, area_ambiguous) = store.resolve_area_identifier(identifier.as_str());
+        let (area, _area_err, area_ambiguous) = store.resolve_area_identifier(identifier.as_str());
+        let task_hits = usize::from(task.is_some()) + task_ambiguous.len();
+        let area_hits = usize::from(area.is_some()) + area_ambiguous.len();
+        let raw = identifier.as_str();
 
-        let task_match = task.is_some();
-        let area_match = area.is_some();
-
-        if task_match && area_match {
-            eprintln!(
-                "Ambiguous identifier '{}' (matches task and area).",
-                identifier.as_str()
-            );
-            continue;
-        }
-
-        if !task_match && !area_match {
-            if !task_ambiguous.is_empty() && !area_ambiguous.is_empty() {
-                eprintln!(
-                    "Ambiguous identifier '{}' (matches multiple tasks and areas).",
-                    identifier.as_str()
-                );
-            } else if !task_ambiguous.is_empty() {
-                eprintln!("{task_err}");
-            } else if !area_ambiguous.is_empty() {
-                eprintln!("{area_err}");
-            } else {
-                eprintln!("Item not found: {}", identifier.as_str());
+        // One namespace must have one hit and the other none. An ambiguous
+        // prefix in either namespace used to fall through to the unique side.
+        if !matches!((task_hits, area_hits), (1, 0) | (0, 1)) {
+            if task_hits == 0 && area_hits == 0 {
+                return Err(format!("Item not found: {raw}"));
             }
-            continue;
+            let _ = task_err;
+            return Err(format!(
+                "Ambiguous identifier '{raw}' ({task_hits} tasks, {area_hits} areas). Refusing to delete."
+            ));
         }
 
         if let Some(task) = task {
             if !task.entity.can_upgrade_to_task7() {
-                eprintln!("Unsupported task entity for deletion: {}", task.entity);
-                continue;
+                return Err(format!(
+                    "Unsupported task entity for deletion: {}",
+                    task.entity
+                ));
             }
             if task.trashed {
-                eprintln!("Item already deleted: {}", task.title);
-                continue;
+                return Err(format!("Item already in Trash: {}", task.title));
             }
-            if task.has_repeater() {
-                eprintln!(
-                    "Task7 repeater tasks are blocked from deletion until repeater bookkeeping is supported: {}",
+            if task.has_repeater() || task.is_recurrence_template() {
+                return Err(format!(
+                    "Recurring tasks are blocked from deletion until recurrence bookkeeping is supported: {}",
                     task.title
-                );
-                continue;
+                ));
             }
             if !seen.insert(task.uuid.clone()) {
                 continue;
@@ -92,10 +87,24 @@ fn build_delete_plan(args: &DeleteArgs, store: &crate::store::ThingsStore) -> De
 
     let mut changes = BTreeMap::new();
     for (uuid, entity, _title) in &targets {
-        changes.insert(uuid.clone(), WireObject::delete(entity.clone()));
+        // Tasks go to Trash (`tr`) so Things can restore them. `t: 2` removes
+        // the history object. Areas have no trash flag in this client.
+        let change = if entity == &EntityType::Task7 {
+            WireObject::update(
+                EntityType::Task7,
+                TaskPatch {
+                    trashed: Some(true),
+                    modification_date: Some(Some(now)),
+                    ..Default::default()
+                },
+            )
+        } else {
+            WireObject::delete(entity.clone())
+        };
+        changes.insert(uuid.clone(), change);
     }
 
-    DeletePlan { targets, changes }
+    Ok(DeletePlan { targets, changes })
 }
 
 impl Command for DeleteArgs {
@@ -106,7 +115,8 @@ impl Command for DeleteArgs {
         ctx: &mut dyn crate::cmd_ctx::CmdCtx,
     ) -> Result<()> {
         let store = cli.load_store()?;
-        let plan = build_delete_plan(self, &store);
+        let plan = build_delete_plan(self, &store, ctx.now_timestamp())
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         if plan.targets.is_empty() {
             return Ok(());
@@ -150,7 +160,7 @@ mod tests {
 
     impl crate::cmd_ctx::CmdCtx for FailingCtx {
         fn now_timestamp(&self) -> f64 {
-            unreachable!()
+            1.0
         }
 
         fn today_timestamp(&self) -> i64 {
@@ -249,10 +259,12 @@ mod tests {
                 item_ids: vec![IdentifierToken::from(TASK_A)],
             },
             &build_store(vec![task(TASK_A, "Alpha", false)]),
-        );
+            1.0,
+        )
+        .expect("plan");
         assert_eq!(
             serde_json::to_value(single.changes).expect("to value"),
-            serde_json::json!({ TASK_A: {"t":2,"e":"Task7","p":{}} })
+            serde_json::json!({ TASK_A: {"t":1,"e":"Task7","p":{"md":1.0,"tr":true}} })
         );
 
         let multi = build_delete_plan(
@@ -260,16 +272,18 @@ mod tests {
                 item_ids: vec![IdentifierToken::from(TASK_A), IdentifierToken::from(AREA_A)],
             },
             &build_store(vec![task(TASK_A, "Alpha", false), area(AREA_A, "Work")]),
-        );
+            1.0,
+        )
+        .expect("plan");
         assert_eq!(
             serde_json::to_value(multi.changes).expect("to value"),
             serde_json::json!({
-                TASK_A: {"t":2,"e":"Task7","p":{}},
+                TASK_A: {"t":1,"e":"Task7","p":{"md":1.0,"tr":true}},
                 AREA_A: {"t":2,"e":"Area3","p":{}}
             })
         );
 
-        let skip_trashed = build_delete_plan(
+        let already_trashed = build_delete_plan(
             &DeleteArgs {
                 item_ids: vec![IdentifierToken::from(TASK_A), IdentifierToken::from(TASK_B)],
             },
@@ -277,10 +291,8 @@ mod tests {
                 task(TASK_A, "Active", false),
                 task(TASK_B, "Trashed", true),
             ]),
+            1.0,
         );
-        assert_eq!(
-            serde_json::to_value(skip_trashed.changes).expect("to value"),
-            serde_json::json!({ TASK_A: {"t":2,"e":"Task7","p":{}} })
-        );
+        assert!(already_trashed.is_err());
     }
 }

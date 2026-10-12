@@ -226,8 +226,13 @@ fn build_new_plan(
 
     let in_target = args.in_target.trim();
     if !in_target.eq_ignore_ascii_case("inbox") {
-        let (project, _, _) = store.resolve_mark_identifier(in_target);
-        let (area, _, _) = store.resolve_area_identifier(in_target);
+        let (project, _, project_ambiguous) = store.resolve_mark_identifier(in_target);
+        let (area, _, area_ambiguous) = store.resolve_area_identifier(in_target);
+        if !project_ambiguous.is_empty() || !area_ambiguous.is_empty() {
+            return Err(format!(
+                "Ambiguous --in target '{in_target}'. Refusing to create the task."
+            ));
+        }
         let project_uuid = project.as_ref().and_then(|p| {
             if p.is_project() {
                 Some(p.uuid.clone())
@@ -312,7 +317,6 @@ fn build_new_plan(
     let target_bucket = props_bucket(&props);
 
     if let Some(anchor) = &anchor
-        && !anchor_is_today
         && task_bucket(anchor, store) != target_bucket
     {
         return Err(
