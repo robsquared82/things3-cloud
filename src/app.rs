@@ -17,13 +17,17 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(name = "things3")]
 #[command(bin_name = "things3")]
-#[command(version)]
-#[command(before_help = concat!("things3 ", env!("CARGO_PKG_VERSION")))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (robsquared82 fork)"))]
+#[command(before_help = concat!(
+    "things3 ",
+    env!("CARGO_PKG_VERSION"),
+    " (robsquared82 fork)"
+))]
 #[command(disable_help_subcommand = true)]
 #[command(about = concat!(
     "things3 v",
     env!("CARGO_PKG_VERSION"),
-    ": Command-line interface for Things 3 via Cloud API"
+    " (robsquared82 fork): Command-line interface for Things 3 via Cloud API"
 ))]
 pub struct Cli {
     /// Disable color output
