@@ -54,6 +54,12 @@ fn build_schedule_plan(
                 .to_string(),
         );
     }
+    if task.is_recurrence_template() {
+        return Err(
+            "Recurring template tasks are blocked from scheduling until recurrence bookkeeping is supported."
+                .to_string(),
+        );
+    }
 
     let mut update = TaskPatch::default();
     let mut when_label: Option<String> = None;

@@ -192,6 +192,18 @@ fn build_edit_plan(
         tasks.push(task);
     }
 
+    let move_raw_early = args.move_target.clone().unwrap_or_default();
+    if !move_raw_early.trim().is_empty() {
+        for task in &tasks {
+            if task.has_repeater() || task.is_recurrence_template() {
+                return Err(format!(
+                    "Recurring tasks are blocked from --move until recurrence bookkeeping is supported: {}",
+                    task.title
+                ));
+            }
+        }
+    }
+
     let mut shared_update = TaskPatch::default();
     let mut move_from_inbox_st: Option<TaskStart> = None;
     let mut labels: Vec<String> = Vec::new();
@@ -211,8 +223,13 @@ fn build_edit_plan(
         } else if move_l == "clear" {
             labels.push("move=clear".to_string());
         } else {
-            let (project_opt, _, _) = store.resolve_mark_identifier(&move_raw);
-            let (area_opt, _, _) = store.resolve_area_identifier(&move_raw);
+            let (project_opt, _, project_ambiguous) = store.resolve_mark_identifier(&move_raw);
+            let (area_opt, _, area_ambiguous) = store.resolve_area_identifier(&move_raw);
+            if !project_ambiguous.is_empty() || !area_ambiguous.is_empty() {
+                return Err(format!(
+                    "Ambiguous --move target '{move_raw}'. Refusing to move."
+                ));
+            }
 
             let project_uuid = project_opt.as_ref().and_then(|p| {
                 if p.is_project() {

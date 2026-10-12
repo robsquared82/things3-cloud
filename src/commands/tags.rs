@@ -72,6 +72,24 @@ struct TagsEditPlan {
     labels: Vec<String>,
 }
 
+fn tag_parent_reaches(
+    store: &crate::store::ThingsStore,
+    start: &crate::ids::ThingsId,
+    needle: &crate::ids::ThingsId,
+) -> bool {
+    let mut current = Some(start.clone());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = current {
+        if &id == needle || !seen.insert(id.clone()) {
+            return true;
+        }
+        current = store
+            .get_tag(&id.to_string())
+            .and_then(|tag| tag.parent_uuid);
+    }
+    false
+}
+
 fn build_tags_edit_plan(
     args: &TagsEditArgs,
     store: &crate::store::ThingsStore,
@@ -106,6 +124,11 @@ fn build_tags_edit_plan(
             };
             if parent.uuid == tag.uuid {
                 return Err("A tag cannot be its own parent.".to_string());
+            }
+            if tag_parent_reaches(store, &parent.uuid, &tag.uuid) {
+                return Err(
+                    "Refusing to parent a tag to itself or to one of its descendants.".to_string(),
+                );
             }
             let parent_id = parent.uuid;
             update.parent_ids = Some(vec![parent_id]);

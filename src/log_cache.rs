@@ -1,16 +1,18 @@
 use std::{
-    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     client::ThingsCloudClient,
-    dirs::create_private_dir,
+    dirs::{
+        create_private_dir, open_private_append, open_private_read, read_private_to_string,
+        write_private_atomic,
+    },
     store::{RawState, fold_item},
     wire::wire_object::WireItem,
 };
@@ -27,6 +29,9 @@ struct CursorData {
     history_key: String,
     #[serde(default)]
     head_index: i64,
+    /// Account that produced `history_key`. Empty on cursors written before this field existed.
+    #[serde(default)]
+    account_email: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -39,14 +44,61 @@ struct StateCacheData {
 
 const STATE_CACHE_VERSION: u8 = 3;
 
-fn read_cursor(path: &Path) -> CursorData {
-    if !path.exists() {
-        return CursorData::default();
-    }
-    let Ok(raw) = fs::read_to_string(path) else {
-        return CursorData::default();
+fn read_cursor(path: &Path) -> Result<CursorData> {
+    let Some(raw) = read_private_to_string(path)? else {
+        return Ok(CursorData::default());
     };
-    serde_json::from_str(&raw).unwrap_or_default()
+    if raw.trim().is_empty() {
+        return Ok(CursorData::default());
+    }
+    serde_json::from_str(&raw)
+        .with_context(|| format!("cursor at {} is not valid JSON", path.display()))
+}
+
+fn same_account(saved: &str, current: &str) -> bool {
+    saved.trim().eq_ignore_ascii_case(current.trim())
+}
+
+/// A saved history key is the capability for one Things database. Do not reuse
+/// it for a different email, and do not reuse a key that no longer matches the
+/// account we can authenticate.
+fn bind_cursor_account(
+    client: &mut ThingsCloudClient,
+    cursor: &CursorData,
+    cache_dir: &Path,
+) -> Result<()> {
+    if cursor.history_key.is_empty() {
+        if client.history_key.is_none() {
+            client.authenticate()?;
+        }
+        return Ok(());
+    }
+
+    if !cursor.account_email.is_empty() && !same_account(&cursor.account_email, &client.email) {
+        bail!(
+            "state directory {} belongs to {}, current credentials are for {}. Refusing to sync so the two Things Cloud accounts are not mixed.",
+            cache_dir.display(),
+            cursor.account_email,
+            client.email
+        );
+    }
+
+    if cursor.account_email.is_empty() {
+        let authed = client
+            .authenticate()
+            .context("saved history key has no account email; authenticating before reuse")?;
+        if authed != cursor.history_key {
+            bail!(
+                "saved history key in {} does not match the current Things Cloud account. Refusing to sync so two accounts are not mixed.",
+                cache_dir.display()
+            );
+        }
+    }
+
+    if client.history_key.is_none() {
+        client.history_key = Some(cursor.history_key.clone());
+    }
+    Ok(())
 }
 
 fn write_cursor(
@@ -54,39 +106,33 @@ fn write_cursor(
     next_start_index: i64,
     history_key: &str,
     head_index: i64,
+    account_email: &str,
 ) -> Result<()> {
     let payload = serde_json::to_string(&serde_json::json!({
         "next_start_index": next_start_index,
         "history_key": history_key,
         "head_index": head_index,
+        "account_email": account_email,
         "updated_at": crate::client::now_timestamp(),
     }))?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, payload)?;
-    fs::rename(tmp, path)?;
+    write_private_atomic(path, payload.as_bytes())?;
     Ok(())
 }
 
 pub fn sync_append_log(client: &mut ThingsCloudClient, cache_dir: &Path) -> Result<()> {
+    let state_dir = crate::dirs::app_state_dir();
+    if cache_dir.starts_with(&state_dir) {
+        create_private_dir(&state_dir)?;
+    }
     create_private_dir(cache_dir)?;
     let log_path = cache_dir.join("things.log");
     let cursor_path = cache_dir.join("cursor.json");
 
-    let cursor = read_cursor(&cursor_path);
+    let cursor = read_cursor(&cursor_path)?;
+    bind_cursor_account(client, &cursor, cache_dir)?;
     let mut start_index = cursor.next_start_index;
 
-    if client.history_key.is_none() {
-        if !cursor.history_key.is_empty() {
-            client.history_key = Some(cursor.history_key.clone());
-        } else {
-            let _ = client.authenticate()?;
-        }
-    }
-
-    let mut fp = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let mut fp = open_private_append(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
 
     loop {
@@ -128,6 +174,7 @@ pub fn sync_append_log(client: &mut ThingsCloudClient, cache_dir: &Path) -> Resu
                 start_index,
                 client.history_key.as_deref().unwrap_or_default(),
                 client.head_index,
+                &client.email,
             )?;
         }
 
@@ -143,29 +190,27 @@ pub fn sync_append_log(client: &mut ThingsCloudClient, cache_dir: &Path) -> Resu
             start_index,
             &current_history_key,
             client.head_index,
+            &client.email,
         )?;
     }
 
     Ok(())
 }
 
-fn read_state_cache(cache_dir: &Path) -> (RawState, u64) {
+fn read_state_cache(cache_dir: &Path) -> Result<(RawState, u64)> {
     let path = cache_dir.join("state_cache.json");
-    if !path.exists() {
-        return (RawState::new(), 0);
-    }
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return (RawState::new(), 0);
+    let Some(raw) = read_private_to_string(&path)? else {
+        return Ok((RawState::new(), 0));
     };
     let Ok(cache) = serde_json::from_str::<StateCacheData>(&raw) else {
-        return (RawState::new(), 0);
+        return Ok((RawState::new(), 0));
     };
 
     if cache.version != STATE_CACHE_VERSION {
-        return (RawState::new(), 0);
+        return Ok((RawState::new(), 0));
     }
 
-    (cache.state, cache.log_offset)
+    Ok((cache.state, cache.log_offset))
 }
 
 fn write_state_cache(cache_dir: &Path, state: &RawState, log_offset: u64) -> Result<()> {
@@ -175,9 +220,7 @@ fn write_state_cache(cache_dir: &Path, state: &RawState, log_offset: u64) -> Res
         log_offset,
         state: state.clone(),
     })?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, payload)?;
-    fs::rename(tmp, path)?;
+    write_private_atomic(&path, payload.as_bytes())?;
     Ok(())
 }
 
@@ -187,11 +230,11 @@ pub fn fold_state_from_append_log(cache_dir: &Path) -> Result<RawState> {
         return Ok(RawState::new());
     }
 
-    let (mut state, byte_offset) = read_state_cache(cache_dir);
+    let (mut state, byte_offset) = read_state_cache(cache_dir)?;
     let mut new_lines = 0u64;
 
-    let mut file =
-        File::open(&log_path).with_context(|| format!("failed to open {}", log_path.display()))?;
+    let mut file = open_private_read(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
     file.seek(SeekFrom::Start(byte_offset))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
@@ -265,8 +308,8 @@ pub fn fold_state_from_append_log_or_empty(cache_dir: &Path) -> RawState {
     fold_state_from_append_log(cache_dir).unwrap_or_default()
 }
 
-pub fn read_cached_head_index(cache_dir: &Path) -> i64 {
-    read_cursor(&cache_dir.join("cursor.json")).head_index
+pub fn read_cached_head_index(cache_dir: &Path) -> Result<i64> {
+    Ok(read_cursor(&cache_dir.join("cursor.json"))?.head_index)
 }
 
 pub fn sync_append_log_or_err(client: &mut ThingsCloudClient, cache_dir: &Path) -> Result<()> {
@@ -275,6 +318,8 @@ pub fn sync_append_log_or_err(client: &mut ThingsCloudClient, cache_dir: &Path) 
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -304,7 +349,7 @@ mod tests {
         let task = store.get_task(task_id).expect("Task7 task after refold");
         assert_eq!(task.title, "Current task");
         assert_eq!(task.entity, crate::wire::wire_object::EntityType::Task7);
-        let (cached_state, offset) = read_state_cache(cache_dir);
+        let (cached_state, offset) = read_state_cache(cache_dir).expect("read state cache");
         assert_eq!(cached_state, state);
         assert_eq!(offset, log.len() as u64);
     }
@@ -363,10 +408,10 @@ mod tests {
         let first_state = fold_state_from_append_log(cache_dir).expect("first fold");
         assert_eq!(first_state.len(), 1);
 
-        let (_, first_offset) = read_state_cache(cache_dir);
+        let (_, first_offset) = read_state_cache(cache_dir).expect("read state cache");
         assert_eq!(first_offset, (line_one.len() + 1) as u64);
 
-        let mut fp = OpenOptions::new()
+        let mut fp = fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
             .expect("open log for append");
@@ -376,7 +421,42 @@ mod tests {
         assert_eq!(second_state.len(), 2);
 
         let expected_offset = fs::metadata(&log_path).expect("log metadata").len();
-        let (_, second_offset) = read_state_cache(cache_dir);
+        let (_, second_offset) = read_state_cache(cache_dir).expect("read state cache");
         assert_eq!(second_offset, expected_offset);
+    }
+
+    #[test]
+    fn sync_refuses_cursor_for_a_different_account() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = temp_dir.path();
+        fs::write(
+            cache_dir.join("cursor.json"),
+            r#"{"next_start_index":4,"history_key":"old-history-key","head_index":4,"account_email":"old@example.com"}"#,
+        )
+        .expect("seed cursor");
+
+        let mut client =
+            ThingsCloudClient::new("new@example.com".to_string(), "not-sent".to_string())
+                .expect("client");
+        let error = sync_append_log(&mut client, cache_dir)
+            .expect_err("different account must fail before any network use")
+            .to_string();
+        assert!(error.contains("old@example.com"), "{error}");
+        assert!(error.contains("new@example.com"), "{error}");
+        assert!(client.history_key.is_none());
+        assert!(!cache_dir.join("things.log").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fold_refuses_a_symlinked_log() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = temp_dir.path();
+        let victim = cache_dir.join("victim.log");
+        fs::write(&victim, "secret\n").expect("seed");
+        std::os::unix::fs::symlink(&victim, cache_dir.join("things.log")).expect("symlink");
+        let error = fold_state_from_append_log(cache_dir).expect_err("symlink log");
+        let error = format!("{error:#}");
+        assert!(error.contains("symlink"), "{error}");
     }
 }

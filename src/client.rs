@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -35,13 +36,46 @@ pub(crate) fn now_timestamp() -> f64 {
     now_ts()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ThingsCloudClient {
     pub email: String,
     pub password: String,
     pub history_key: Option<String>,
     pub head_index: i64,
     http: Client,
+}
+
+impl fmt::Debug for ThingsCloudClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThingsCloudClient")
+            .field("email", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field(
+                "history_key",
+                &self.history_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("head_index", &self.head_index)
+            .finish_non_exhaustive()
+    }
+}
+
+fn redact_url(url: &str) -> String {
+    if let Some(index) = url.find("/history/") {
+        let rest = &url[index + "/history/".len()..];
+        let key_end = rest.find('/').unwrap_or(rest.len());
+        let mut out = String::with_capacity(url.len());
+        out.push_str(&url[..index]);
+        out.push_str("/history/<redacted>");
+        out.push_str(&rest[key_end..]);
+        return out;
+    }
+    if let Some(index) = url.find("/account/") {
+        let mut out = String::with_capacity(index + "/account/<redacted>".len());
+        out.push_str(&url[..index]);
+        out.push_str("/account/<redacted>");
+        return out;
+    }
+    url.to_string()
 }
 
 impl ThingsCloudClient {
@@ -85,20 +119,29 @@ impl ThingsCloudClient {
                 .json(&payload);
         }
 
+        let safe_url = redact_url(url);
         let resp = req
             .send()
-            .with_context(|| format!("request failed: {url}"))?;
+            .with_context(|| format!("request failed: {safe_url}"))?;
         let status = resp.status();
         let text = resp.text().with_context(|| {
-            format!("failed reading body from {url} (HTTP {})", status.as_u16())
+            format!(
+                "failed reading body from {safe_url} (HTTP {})",
+                status.as_u16()
+            )
         })?;
         if !status.is_success() {
-            return Err(anyhow!("HTTP {} for {}: {}", status.as_u16(), url, text));
+            return Err(anyhow!(
+                "HTTP {} for {}: {}",
+                status.as_u16(),
+                safe_url,
+                text
+            ));
         }
         if text.trim().is_empty() {
             return Ok(json!({}));
         }
-        serde_json::from_str(&text).with_context(|| format!("invalid json from {url}"))
+        serde_json::from_str(&text).with_context(|| format!("invalid json from {safe_url}"))
     }
 
     pub fn authenticate(&mut self) -> Result<String> {
@@ -203,5 +246,30 @@ impl ThingsCloudClient {
             .unwrap_or(idx);
         self.head_index = new_index;
         Ok(new_index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url;
+
+    #[test]
+    fn redacts_history_key_and_account_email() {
+        assert_eq!(
+            redact_url(
+                "https://cloud.culturedcode.com/version/1/history/SECRETKEY/items?start-index=0"
+            ),
+            "https://cloud.culturedcode.com/version/1/history/<redacted>/items?start-index=0"
+        );
+        assert_eq!(
+            redact_url(
+                "https://cloud.culturedcode.com/version/1/history/SECRETKEY/commit?ancestor-index=3&_cnt=1"
+            ),
+            "https://cloud.culturedcode.com/version/1/history/<redacted>/commit?ancestor-index=3&_cnt=1"
+        );
+        assert_eq!(
+            redact_url("https://cloud.culturedcode.com/version/1/account/user%40example.com"),
+            "https://cloud.culturedcode.com/version/1/account/<redacted>"
+        );
     }
 }

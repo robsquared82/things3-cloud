@@ -2,6 +2,9 @@
 set -euo pipefail
 
 export TZ=UTC
+# Test snapshots read the commit body from the debug log. The binary omits it
+# unless this is set, so a normal debug log does not contain task notes.
+export THINGS3_LOG_COMMIT_BODY=1
 
 # Wrapper for trycmd cases.
 #

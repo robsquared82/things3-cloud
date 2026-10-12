@@ -288,7 +288,7 @@ fn build_reorder_plan(
             changes,
             ancestor_index: ancestor,
         });
-        ancestor = ancestor.map(|v| v + 1).or(Some(1));
+        ancestor = ancestor.map(|v| v + 1);
     }
 
     let reorder_label = if args.before_id.is_some() {
@@ -312,25 +312,18 @@ impl Command for ReorderArgs {
         ctx: &mut dyn crate::cmd_ctx::CmdCtx,
     ) -> Result<()> {
         let store = cli.load_store()?;
-        let plan = match build_reorder_plan(
+        let plan = build_reorder_plan(
             self,
             &store,
             ctx.now_timestamp(),
             ctx.today_timestamp(),
-            None,
-        ) {
-            Ok(plan) => plan,
-            Err(err) => {
-                eprintln!("{err}");
-                return Ok(());
-            }
-        };
+            Some(ctx.current_head_index()),
+        )
+        .map_err(|err| anyhow::anyhow!(err))?;
 
         for commit in plan.commits {
-            if let Err(e) = ctx.commit_changes(commit.changes, commit.ancestor_index) {
-                eprintln!("Failed to reorder item: {e}");
-                return Ok(());
-            }
+            ctx.commit_changes(commit.changes, commit.ancestor_index)
+                .map_err(|err| anyhow::anyhow!("Failed to reorder item: {err}"))?;
         }
 
         writeln!(
